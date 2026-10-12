@@ -1,28 +1,23 @@
 /**
  * File: userscript-debugger-module.js
- * Version: 1.0.2
- * Advanced Modular Userscript Debugger Engine
- * Author: Github.com/ShavedW00kie/
- * Optimized for Desktop PC, Mobile Browsers, and TornPDA Native WebViews
- *
+ * Version: 1.0.4
+ * Advanced Modular Userscript Debugger with optional DOM Inspector
+ * Author: ShavedW00kie (Torn: ThaWookie [2954173] )
+ * Namespace: https://github.com/ShavedW00kie/
+ * Target: Embedded inside a Torn.com userscript IIFE (desktop and TornPDA).
  * License: BSD-3-Clause
  *
  * Copyright (c) 2026 ShavedW00kie
- *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
- *
  * 1. Redistributions of source code must retain the above copyright notice,
  *    this list of conditions and the following disclaimer.
- *
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  *    this list of conditions and the following disclaimer in the documentation
  *    and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
+ * 3. Neither the name of the copyright holder nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -34,938 +29,732 @@
  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Integration inside the host userscript's IIFE, AFTER this function definition:
+ *   const MyDebug = initializeModularDebugger(GM_info.script.name);
+ *   MyDebug.log("Ready");
+ *   bugButton.addEventListener("click", () => MyDebug.toggleView());
+ *   copyButton.addEventListener("click", function () { void MyDebug.copy(this); });
+ *   // Optional: MyDebug.inspect(), MyDebug.inspectElement(element),
+ *   // MyDebug.watchElement(element), MyDebug.stopInspection(), MyDebug.destroy().
+ *
+ * This file is a source module, not an independently installable userscript.
+ * The host userscript supplies its own ==UserScript== metadata and IIFE.
  */
-
-/**
- * initializeModularDebugger()
- *
- * Creates an isolated debugger instance for a userscript.
- *
- * Public API:
- *   MyDebug.log(message)
- *   MyDebug.info(message)
- *   MyDebug.warn(message)
- *   MyDebug.error(message)
- *   MyDebug.copy(buttonElement)
- *   MyDebug.toggleView()
- *   MyDebug.clear()
- *
- * Example:
- *
- * const MyDebug = initializeModularDebugger(GM_info.script.name);
- *
- * MyDebug.log("Script initialized.");
- * MyDebug.error("Something went wrong.");
- *
- * // Settings UI:
- * debugButton.onclick = () => MyDebug.toggleView();
- * copyButton.onclick = function () {
- *     MyDebug.copy(this);
- * };
- */
-function initializeModularDebugger(scriptNamespace = "App") {
+function initializeModularDebugger(scriptNamespace) {
     "use strict";
+    if (scriptNamespace === undefined) scriptNamespace = "App";
 
-    /* ============================================================
-     * 1. INSTANCE ISOLATION
-     * ============================================================ */
-
-    const randomSuffix = (() => {
+    const randomId = (() => {
         try {
-            if (
-                typeof crypto !== "undefined" &&
-                typeof crypto.randomUUID === "function"
-            ) {
+            if (typeof crypto !== "undefined" && crypto.randomUUID) {
                 return crypto.randomUUID().replace(/-/g, "");
             }
-        } catch (_) {
-            // Fall through to compatibility fallback.
-        }
-
-        return Math.random()
-            .toString(36)
-            .slice(2, 11) +
-            Date.now().toString(36);
+        } catch (_) { /* WebView fallback. */ }
+        return Math.random().toString(36).slice(2) + Date.now().toString(36);
     })();
-
-    const prefix = `us-debug-${randomSuffix}`;
-
-    const CONTAINER_ID = `${prefix}-box`;
-    const LOG_AREA_ID = `${prefix}-logs`;
-
-    /* ============================================================
-     * 2. MEMORY LIMITS
-     * ============================================================ */
-
-    /*
-     * Clipboard-safe baseline.
-     *
-     * JavaScript strings are UTF-16. This limit is intentionally
-     * character-based rather than byte-based because browser clipboard
-     * implementations differ in their handling of Unicode.
-     */
-    const CLIPBOARD_MAX_CHARS = 10 * 1024 * 1024;
-
-    /*
-     * Reserve approximately 900 KiB of headroom.
-     *
-     * Effective maximum retained log buffer:
-     * approximately 9.1 million characters.
-     */
-    const BUFFER_REDUCTION_MARGIN = 900 * 1024;
-
-    const MAX_LOG_STRING_LENGTH =
-        CLIPBOARD_MAX_CHARS - BUFFER_REDUCTION_MARGIN;
-
-    /*
-     * Never allow one pathological message to exceed the entire
-     * configured buffer.
-     */
-    const MAX_SINGLE_LOG_LENGTH = MAX_LOG_STRING_LENGTH;
-
-    /* ============================================================
-     * 3. INTERNAL STATE
-     * ============================================================ */
-
+    const id = `tw-debug-${randomId}`;
+    const LIMITS = Object.freeze({
+        buffer: (10 * 1024 * 1024) - (900 * 1024),
+        entry: 64 * 1024,
+        renderEntries: 180,
+        renderChars: 128 * 1024,
+        report: 15000,
+        html: 6000,
+        parents: 6,
+        children: 12,
+        nodes: 65,
+        mutations: 40
+    });
     const state = {
-        logs: [],
-        currentBufferLength: 0,
-
-        domElements: {
-            container: null,
-            logArea: null
-        },
-
-        observer: null,
-        observerAttached: false,
-
-        destroyed: false
+        logs: [], head: 0, length: 0, destroyed: false, 
+        frames: new Set(), statuses: new Map(), resizeObserver: null,
+        root: null, logArea: null, inspector: null, inspectorText: null,
+        style: null, statusBar: null, highlight: null,
+        panelMode: "logs", selected: null, picking: false,
+        watching: false, changeLog: [],
+        observer: null, parentObserver: null, uiObserver: null,
+        observedBody: null, renderPending: false,
+        pendingMutations: 0, mutationLogPending: false,
+        viewportListeners: false, highlightPending: false
     };
+    const SENSITIVE = /(?:^key$|api[_-]?key|apikey|token|auth|authorization|cookie|secret|passwd|password|csrf|session|bearer|credential|client[_-]?secret|refresh[_-]?token|access[_-]?token)/i;
+    const SAFE_ATTRIBUTES = new Set([
+        "id", "class", "role", "type", "aria-expanded",
+        "aria-hidden", "data-testid", "data-test", "data-role", "data-state"
+    ]);
 
-    /* ============================================================
-     * 4. DOM UTILITIES
-     * ============================================================ */
-
-    function getDocumentBody() {
-        return document && document.body
-            ? document.body
-            : null;
+    /* ---------- Redacted, bounded logging ---------- */
+    function redact(value) {
+        return String(value)
+            .replace(/\b(?:Authorization|Proxy-Authorization)\s*:\s*[^\r\n]+/gi, "Authorization: [REDACTED]")
+            .replace(/\b[A-Za-z0-9]{16}\b/g, "[POSSIBLE KEY REDACTED]")
+            // Bearer tokens and known secret-bearing URL parameters.
+            .replace(/(\bBearer\s+)[A-Za-z0-9._~+/-]+/gi, "$1[REDACTED]")
+            .replace(/([?&](?:key|api_key|token|access_token|refresh_token|secret|session|csrf)=)[^&#\s\"'<>}\]]+/gi, "$1[REDACTED]")
+            // Quoted property values, including embedded spaces.
+            .replace(/(["']?(?:api[_-]?key|apikey|token|authorization|cookie|password|passwd|secret|csrf|session|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*)(["'])([^"']*)\2/gi,
+                (_, prefix, quote) => `${prefix}${quote}[REDACTED]${quote}`)
+            // Unquoted key=value patterns.
+            .replace(/(["']?(?:api[_-]?key|apikey|token|authorization|cookie|password|passwd|secret|csrf|session|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*)(?!["'])([^\s"',;}&\]]+)/gi,
+                (_, prefix) => `${prefix}[REDACTED]`);
     }
 
-    function getExistingContainer() {
-        return document.getElementById(CONTAINER_ID);
-    }
-
-    function isContainerAttached() {
-        return Boolean(
-            state.domElements.container &&
-            state.domElements.container.isConnected
-        );
-    }
-
-    function ensureObserver() {
-        if (
-            state.observerAttached ||
-            typeof MutationObserver === "undefined"
-        ) {
-            return;
+    // Does not call getters or toJSON. Proxies can still execute traps; never
+    // deliberately pass hostile proxies to an in-process diagnostic function.
+    function safeSerialize(value) {
+        let remaining = 240;
+        const path = new WeakSet();
+        function visit(item, depth) {
+            if (--remaining < 0) return "[Traversal limit]";
+            if (typeof item === "string") return redact(item.slice(0, 8192));
+            if (item === null || typeof item === "boolean" || typeof item === "number") return item;
+            if (typeof item === "undefined") return "[undefined]";
+            if (typeof item === "bigint" || typeof item === "symbol") return String(item);
+            if (typeof item === "function") return "[Function]";
+            if (path.has(item)) return "[Circular]";
+            if (depth >= 5) return "[Depth limit]";
+            path.add(item);
+            try {
+                const result = Object.create(null);
+                let count = 0;
+                if (item instanceof Error) {
+                    for (const key of ["name", "message", "stack"]) {
+                        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+                        result[key] = descriptor && "value" in descriptor
+                            ? visit(descriptor.value, depth + 1) : "[Unavailable/accessor]";
+                    }
+                }
+                // for-in permits early exit without allocating Object.keys for
+                // every property. Reflection itself is not a hard time limit.
+                for (const key in item) {
+                    if (!Object.prototype.hasOwnProperty.call(item, key)) continue;
+                    if (++count > 40 || remaining <= 0) { result["[Truncated]"] = true; break; }
+                    const descriptor = Object.getOwnPropertyDescriptor(item, key);
+                    result[redact(key.slice(0, 160))] = SENSITIVE.test(key) ? "[REDACTED]"
+                        : descriptor && "value" in descriptor ? visit(descriptor.value, depth + 1) : "[Accessor omitted]";
+                }
+                return result;
+            } catch (_) { return "[Unserializable]"; }
+            finally { path.delete(item); }
         }
-
-        const body = getDocumentBody();
-
-        if (!body) {
-            return;
+        try {
+            if (typeof value === "string") return redact(value.slice(0, LIMITS.entry));
+            return JSON.stringify(visit(value, 0));
+        } catch (_) { return "[Unserializable]"; }
+    }
+    function scheduleFrame(callback) {
+        if (state.destroyed) return;
+        if (typeof requestAnimationFrame !== "function") { callback(); return; }
+        const handle = requestAnimationFrame(() => {
+            state.frames.delete(handle);
+            if (!state.destroyed) callback();
+        });
+        state.frames.add(handle);
+    }
+    function trim(text, max) {
+        text = String(text);
+        return text.length > max ? `${text.slice(0, Math.max(0, max - 17))}[TRUNCATED]` : text;
+    }
+    function log(message, level = "INFO") {
+        if (state.destroyed) return;
+        const label = typeof level === "string" && /^(INFO|WARN|ERROR|DEBUG)$/i.test(level) ? level.toUpperCase() : "INFO";
+        const timestamp = new Date().toISOString();
+        const entry = trim(`[${timestamp}] [${label}] ${safeSerialize(message)}`, LIMITS.entry);
+        const size = entry.length + 1;
+        while (state.head < state.logs.length && state.length + size > LIMITS.buffer) {
+            state.length -= state.logs[state.head].length + 1;
+            state.logs[state.head++] = null; // Release pruned strings immediately.
         }
+        if (state.head > 2048) { state.logs = state.logs.slice(state.head); state.head = 0; }
+        state.logs.push(entry);
+        state.length += size;
+        queueRender();
+    }
+    const info = message => log(message, "INFO");
+    const warn = message => log(message, "WARN");
+    const error = message => log(message, "ERROR");
+    function clear() {
+        state.logs.length = 0;
+        state.head = 0;
+        state.length = 0;
+        renderLogs();
+    }
+    function queueRender() {
+        if (!state.logArea || !state.root || state.root.hidden || state.panelMode !== "logs") return;
+        if (state.renderPending) return;
+        state.renderPending = true;
+        scheduleFrame(() => { state.renderPending = false; renderLogs(); });
+    }
+    function renderLogs() {
+        if (state.destroyed || !state.root || state.root.hidden || !state.logArea || !state.logArea.isConnected || state.panelMode !== "logs") return;
+        const subset = [];
+        let chars = 0;
+        for (let i = state.logs.length - 1; i >= state.head && subset.length < LIMITS.renderEntries; i--) {
+            if (chars + state.logs[i].length + 1 > LIMITS.renderChars) break;
+            subset.unshift(state.logs[i]); chars += state.logs[i].length + 1;
+        }
+        const skipped = state.logs.length - state.head - subset.length;
+        state.logArea.textContent = (skipped ? `[${skipped} earlier entries retained for copying]\n` : "") + subset.join("\n");
+        state.logArea.scrollTop = state.logArea.scrollHeight;
+    }
 
-        state.observer = new MutationObserver(() => {
-            /*
-             * Do not continuously recreate the UI.
-             *
-             * If the user intentionally hides the debugger, the
-             * element still exists and therefore remains untouched.
-             *
-             * If Torn or another page lifecycle removes the element,
-             * the internal references are invalidated so the next
-             * toggleView() can recreate it safely.
-             */
-            if (
-                state.domElements.container &&
-                !state.domElements.container.isConnected
-            ) {
-                state.domElements.container = null;
-                state.domElements.logArea = null;
+    /* ---------- Clipboard (Tampermonkey, TornPDA, browser) ---------- */
+    function copyFallback(text) {
+        if (!document.body) return false;
+        const input = document.createElement("textarea");
+        const previousFocus = document.activeElement;
+        const selection = typeof window.getSelection === "function" ? window.getSelection() : null;
+        const ranges = [];
+        if (selection) for (let i = 0; i < selection.rangeCount; i++) ranges.push(selection.getRangeAt(i).cloneRange());
+        let caret = null;
+        try { if (previousFocus && typeof previousFocus.selectionStart === "number") caret = [previousFocus.selectionStart, previousFocus.selectionEnd, previousFocus.selectionDirection]; } catch (_) {}
+        input.value = text;
+        input.readOnly = true;
+        input.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;z-index:-1";
+        try {
+            document.body.appendChild(input);
+            input.focus();
+            input.select();
+            input.setSelectionRange(0, text.length);
+            return Boolean(document.execCommand("copy"));
+        } catch (_) { return false; }
+        finally {
+            input.remove();
+            try { if (previousFocus && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+                if (caret) previousFocus.setSelectionRange(...caret);
+                if (selection) { selection.removeAllRanges(); ranges.forEach(range => selection.addRange(range)); } } catch (_) { /* Non-focusable element. */ }
+        }
+    }
+    async function writeClipboard(text) {
+        try {
+            if (typeof GM_setClipboard === "function") {
+                await Promise.resolve(GM_setClipboard(text, "text"));
+                return true;
             }
-        });
-
-        state.observer.observe(body, {
-            childList: true,
-            subtree: true
-        });
-
-        state.observerAttached = true;
+            if (typeof GM !== "undefined" && typeof GM.setClipboard === "function") {
+                await GM.setClipboard(text, "text");
+                return true;
+            }
+        } catch (_) { /* Try browser APIs. */ }
+        if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+            try { await navigator.clipboard.writeText(text); return true; }
+            catch (_) { /* Restricted WebView. */ }
+        }
+        return copyFallback(text);
+    }
+    function showCopyResult(button, result) {
+        if (state.destroyed || !button || !button.isConnected) return;
+        let saved = state.statuses.get(button);
+        if (saved) clearTimeout(saved.timer);
+        else saved = { nodes: Array.from(button.childNodes), timer: null };
+        button.textContent = result;
+        // This timer is only UI feedback, never element discovery or polling.
+        saved.timer = setTimeout(() => {
+            button.replaceChildren(...saved.nodes);
+            state.statuses.delete(button);
+        }, 1300);
+        state.statuses.set(button, saved);
+    }
+    async function copy(button = null) {
+        if (state.destroyed) return false;
+        const text = state.logs.slice(state.head).join("\n");
+        if (!text) { showCopyResult(button, "Empty"); return false; }
+        const success = await writeClipboard(text);
+        showCopyResult(button, success ? "Copied!" : "Failed");
+        if (!success) warn("Clipboard unavailable. Open debugger to select and copy manually.");
+        return success;
     }
 
-    function appendToBody(element) {
-        const body = getDocumentBody();
+    /* ---------- Safe DOM descriptions ---------- */
+    function isElement(node) { return Boolean(node && node.nodeType === 1 && node.tagName); }
+    function tag(node) { return isElement(node) ? node.tagName.toLowerCase() : "(none)"; }
+    function describe(node) {
+        if (!isElement(node)) return "(none)";
+        let text = tag(node);
+        const nodeId = node.getAttribute("id");
+        if (nodeId && !SENSITIVE.test(nodeId)) text += `#${trim(redact(nodeId), 50)}`;
+        const classes = Array.from(node.classList || []).filter(name => !SENSITIVE.test(name)).slice(0, 3);
+        if (classes.length) text += "." + classes.map(name => trim(redact(name), 48)).join(".");
+        return trim(text, 180);
+    }
+    function selectorSegment(node) {
+        if (!isElement(node)) return "";
+        const nodeId = node.getAttribute("id");
+        if (nodeId && /^[A-Za-z_][\w-]{0,60}$/.test(nodeId) && !SENSITIVE.test(nodeId)) {
+            return `#${nodeId}`;
+        }
+        let part = tag(node);
+        const classNames = Array.from(node.classList || [])
+            .filter(name => /^[A-Za-z_][\w-]{0,45}$/.test(name) && !SENSITIVE.test(name))
+            .slice(0, 2);
+        part += classNames.map(name => `.${name}`).join("");
+        if (node.parentElement) {
+            const same = Array.from(node.parentElement.children).filter(sibling => sibling.tagName === node.tagName);
+            if (same.length > 1) part += `:nth-of-type(${same.indexOf(node) + 1})`;
+        }
+        return part;
+    }
+    function makeSelector(element) {
+        const segments = [];
+        let current = element;
+        for (let step = 0; step < LIMITS.parents && isElement(current); step++) {
+            const segment = selectorSegment(current);
+            segments.unshift(segment);
+            if (segment.startsWith("#")) break;
+            current = current.parentElement;
+        }
+        const selector = segments.join(" > ");
+        if (selector.length > 500) return "(selector exceeds safe length)";
+        if (redact(selector) !== selector) return "(selector omitted: possible credential)";
+        return selector;
+    }
+    function safeAttributeText(element) {
+        const result = [];
+        if (!isElement(element)) return "";
+        for (const attr of Array.from(element.attributes || [])) {
+            if (!SAFE_ATTRIBUTES.has(attr.name) || SENSITIVE.test(attr.name)) continue;
+            if (SENSITIVE.test(attr.value)) continue;
+            result.push(`${attr.name}="${escapeHTML(trim(redact(attr.value), 90))}"`);
+            if (result.length >= 8) break;
+        }
+        return result.length ? ` ${result.join(" ")}` : "";
+    }
+    function escapeHTML(value) {
+        return String(value).replace(/[&<>"']/g, character => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+        })[character]);
+    }
+    function structuralHTML(element) {
+        let budget = LIMITS.nodes;
+        const skip = /^(script|style|noscript|template|iframe|object|embed)$/i;
+        function recurse(node, depth) {
+            if (!isElement(node) || budget-- <= 0) return "";
+            const name = tag(node);
+            const open = `<${name}${safeAttributeText(node)}>`;
+            if (skip.test(name)) return `${open}[contents omitted]</${name}>`;
+            if (depth >= 2) return `${open}[descendants omitted]</${name}>`;
+            const kids = Array.from(node.children).slice(0, LIMITS.children);
+            const nested = kids.map(child => recurse(child, depth + 1)).join("\n");
+            const note = node.children.length > LIMITS.children ? "\n[additional children omitted]" : "";
+            return `${open}${nested ? `\n${nested}${note}\n` : "[text omitted]"}</${name}>`;
+        }
+        return trim(recurse(element, 0), LIMITS.html);
+    }
+    function reactRootHint(element) {
+        let node = element;
+        for (let i = 0; i < LIMITS.parents && isElement(node); i++, node = node.parentElement) {
+            const candidateId = node.getAttribute("id") || "";
+            if (/^(?:react-root|root|__next)$/i.test(candidateId) || node.hasAttribute("data-reactroot")) {
+                return `${describe(node)} (heuristic only)`;
+            }
+        }
+        return "Not detected (does not rule out React)";
+    }
+    function getInspectionReport() {
+        const element = state.selected;
+        if (!isElement(element)) return "No element selected.";
+        const ancestors = [];
+        let ancestor = element.parentElement;
+        for (let i = 0; i < LIMITS.parents && isElement(ancestor); i++, ancestor = ancestor.parentElement) {
+            ancestors.push(`  ${i + 1}. ${describe(ancestor)}`);
+        }
+        const children = Array.from(element.children).slice(0, LIMITS.children)
+            .map((child, index) => `  ${index + 1}. ${describe(child)}`);
+        const page = typeof location !== "undefined"
+            ? (location.origin === "null" ? "(local document)" : `${location.origin}${location.pathname}`)
+            : "(unknown)";
+        return trim(redact([
+            `DOM INSPECTION | ${redact(String(scriptNamespace))}`,
+            `Time: ${new Date().toISOString()}`,
+            `Page (query omitted): ${redact(page)}`,
+            `Selected: ${describe(element)}`,
+            `Connected: ${element.isConnected}`,
+            `Selector (best effort): ${makeSelector(element)}`,
+            `React container hint: ${reactRootHint(element)}`,
+            `Parent chain:\n${ancestors.join("\n") || "  (none)"}`,
+            `Immediate children (${element.children.length}):\n${children.join("\n") || "  (none)"}`,
+            `Sibling context: previous=${describe(element.previousElementSibling)}, next=${describe(element.nextElementSibling)}`,
+            `Structural preview (text nodes, form values, URLs and scripts omitted; review attributes before sharing):\n${structuralHTML(element)}`,
+            `Recent observed mutations (${state.changeLog.length}):\n${state.changeLog.join("\n") || "  (none)"}`
+        ].join("\n\n")), LIMITS.report);
+    }
 
-        if (!body || !element) {
+    /* ---------- On-demand DOM selection and mutation watch ---------- */
+    function isOurUI(node) {
+        return Boolean(isElement(node) && (
+            (state.root && state.root.contains(node)) ||
+            (state.highlight && state.highlight.contains(node))
+        ));
+    }
+    function ensureHighlight() {
+        if (state.destroyed || !state.selected || !state.root || state.root.hidden || state.panelMode !== "inspect") return null;
+        if (state.highlight && state.highlight.isConnected) return state.highlight;
+        if (!document.body) return null;
+        const node = document.createElement("div");
+        node.setAttribute("aria-hidden", "true");
+        node.style.cssText = "position:fixed;pointer-events:none;z-index:2147483646;border:2px solid #00dbff;box-shadow:0 0 0 1px #001e28;box-sizing:border-box;display:none";
+        document.body.appendChild(node);
+        state.highlight = node;
+        return node;
+    }
+    function updateHighlight() {
+        const marker = ensureHighlight();
+        if (!marker) return;
+        const node = state.selected;
+        if (!isElement(node) || !node.isConnected || !state.root || state.root.hidden || state.panelMode !== "inspect") {
+            marker.style.display = "none";
+            return;
+        }
+        const rect = node.getBoundingClientRect();
+        marker.style.display = "block";
+        marker.style.top = `${rect.top}px`;
+        marker.style.left = `${rect.left}px`;
+        marker.style.width = `${rect.width}px`;
+        marker.style.height = `${rect.height}px`;
+    }
+    function onViewportChanged() {
+        if (state.destroyed || !state.selected || state.highlightPending || state.panelMode !== "inspect") return;
+        state.highlightPending = true;
+        scheduleFrame(() => {
+            state.highlightPending = false;
+            updateHighlight();
+        });
+    }
+    function setViewportListeners(enable) {
+        if (typeof window === "undefined" || enable === state.viewportListeners) return;
+        state.viewportListeners = enable;
+        const method = enable ? "addEventListener" : "removeEventListener";
+        window[method]("scroll", onViewportChanged, true);
+        window[method]("resize", onViewportChanged);
+    }
+    function removeHighlight() {
+        if (state.highlight) { state.highlight.remove(); state.highlight = null; }
+    }
+    function updateInspector() {
+        if (!state.inspectorText) return;
+        state.inspectorText.textContent = state.selected ? trim([
+            `Selected: ${describe(state.selected)}`,
+            `Parent: ${describe(state.selected.parentElement)}`,
+            `Children: ${state.selected.children.length}`,
+            `Selector: ${makeSelector(state.selected)}`,
+            `Connected: ${state.selected.isConnected}`,
+            `Watch: ${state.watching ? "ON" : "OFF"} | Changes: ${state.changeLog.length}`
+        ].join("\n"), 1100) : "Tap Pick, then tap a Torn page element.\nNo page data is collected until inspection is used.";
+        if (state.statusBar) state.statusBar.textContent = state.picking ? "PICK MODE: tap a page element or press Esc" : "Inspector idle";
+        updateHighlight();
+    }
+    function suppressPickAction(event) {
+        if (isOurUI(event.target)) return;
+        event.stopImmediatePropagation();
+        // Preserve the browser synthetic click needed for tap selection.
+    }
+    function onPickClick(event) {
+        if (isOurUI(event.target)) return;
+        // Capture before Torn/React click handlers so selecting a link does not navigate.
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (isElement(event.target)) inspectElement(event.target);
+        stopPicker();
+    }
+    function onPickKey(event) {
+        if (event.key === "Escape") {
+            event.preventDefault();
+            stopPicker();
+            updateInspector();
+        }
+    }
+    function startPicker() {
+        if (state.destroyed || !state.root || !state.root.isConnected || state.root.hidden || state.picking) return;
+        state.picking = true;
+        document.addEventListener("click", onPickClick, true);
+        ["pointerdown", "pointerup", "touchstart", "touchend", "mousedown", "mouseup"].forEach(type => document.addEventListener(type, suppressPickAction, { capture: true, passive: false }));
+        document.addEventListener("keydown", onPickKey, true);
+        updateInspector();
+    }
+    function stopPicker() {
+        if (!state.picking) return;
+        state.picking = false;
+        document.removeEventListener("click", onPickClick, true);
+        ["pointerdown", "pointerup", "touchstart", "touchend", "mousedown", "mouseup"].forEach(type => document.removeEventListener(type, suppressPickAction, true));
+        document.removeEventListener("keydown", onPickKey, true);
+        updateInspector();
+    }
+    function stopWatch() {
+        if (state.observer) state.observer.disconnect();
+        if (state.parentObserver) state.parentObserver.disconnect();
+        state.observer = null;
+        state.parentObserver = null;
+        state.watching = false;
+        state.pendingMutations = 0;
+        updateInspector();
+    }
+    function handleMutations(mutations) {
+        if (!state.watching) return;
+        const stamp = new Date().toISOString();
+        let changed = 0;
+        for (const mutation of mutations) {
+            if (changed >= 8) break;
+            const detail = mutation.type === "characterData" ? "text node changed (content omitted)" : mutation.type === "attributes"
+                ? `attribute ${mutation.attributeName} on ${describe(mutation.target)}`
+                : `childList (+${mutation.addedNodes.length}/-${mutation.removedNodes.length}) on ${describe(mutation.target)}`;
+            state.changeLog.push(`[${stamp}] ${detail}`);
+            changed++;
+        }
+        while (state.changeLog.length > LIMITS.mutations) state.changeLog.shift();
+        if (changed) {
+            state.pendingMutations += changed;
+            if (!state.mutationLogPending) {
+                state.mutationLogPending = true;
+                scheduleFrame(() => {
+                    state.mutationLogPending = false;
+                    const count = state.pendingMutations;
+                    state.pendingMutations = 0;
+                    if (count && state.watching) log(`DOM watch: ${count} sampled change(s) near ${describe(state.selected)}`, "DEBUG");
+                });
+            }
+        }
+        if (state.selected && !state.selected.isConnected) {
+            warn(`DOM watch: selected element detached: ${describe(state.selected)}`);
+            stopWatch();
+        }
+        updateInspector();
+    }
+    function watchElement(element = state.selected) {
+        if (state.destroyed || !isElement(element) || !element.isConnected || element === document.documentElement || element === document.body) {
+            warn("DOM watch requires a specific element, not the document root/body.");
             return false;
         }
+        if (typeof MutationObserver === "undefined") {
+            warn("MutationObserver is unavailable in this WebView.");
+            return false;
+        }
+        stopWatch();
+        if (element !== state.selected && !inspectElement(element)) return false;
+        state.changeLog.length = 0;
+        // Observe the chosen subtree and direct child lists along its ancestor chain.
+        state.observer = new MutationObserver(handleMutations);
+        state.observer.observe(element, {
+            attributes: true, childList: true, characterData: true, subtree: true,
+            attributeFilter: ["class", "id", "role", "aria-expanded", "hidden", "disabled", "data-state"]
+        });
+        if (element.parentElement) {
+            state.parentObserver = new MutationObserver(handleMutations);
+            let ancestor = element.parentElement;
+            while (ancestor) {
+                state.parentObserver.observe(ancestor, { childList: true });
+                ancestor = ancestor.parentNode;
+            }
+        }
+        state.watching = true;
+        info(`DOM watch enabled: ${describe(element)}`);
+        updateInspector();
+        return true;
+    }
+    function moveSelection(direction) {
+        const selected = state.selected;
+        if (!isElement(selected)) return;
+        const next = direction === "parent" ? selected.parentElement : selected.firstElementChild;
+        if (next && next !== document.body && next !== document.documentElement) inspectElement(next);
+    }
+    function inspectElement(element) {
+        if (state.destroyed || !isElement(element) || isOurUI(element) || !ensureUI()) return false;
+        if (state.watching && state.selected !== element) stopWatch();
+        state.selected = element;
+        if (state.resizeObserver) state.resizeObserver.disconnect();
+        if (typeof ResizeObserver === "function") {
+            state.resizeObserver = new ResizeObserver(onViewportChanged);
+            state.resizeObserver.observe(element);
+        }
+        state.changeLog.length = 0;
+        showPanel("inspect");
+        updateInspector();
+        info(`DOM selected: ${describe(element)} | ${makeSelector(element)}`);
+        return true;
+    }
+    function inspect() {
+        if (!showPanel("inspect")) return false;
+        startPicker();
+        return true;
+    }
+    function stopInspection() {
+        stopPicker();
+        stopWatch();
+        state.selected = null;
+        if (state.resizeObserver) state.resizeObserver.disconnect();
+        state.resizeObserver = null;
+        state.changeLog.length = 0;
+        removeHighlight();
+        setViewportListeners(false);
+        if (state.root && !state.root.hidden) showPanel("logs");
+    }
+    async function copyInspection(button = null) {
+        if (state.destroyed) return false;
+        if (!state.selected) { showCopyResult(button, "No selection"); return false; }
+        const result = await writeClipboard(getInspectionReport());
+        showCopyResult(button, result ? "Copied!" : "Failed");
+        return result;
+    }
 
-        body.appendChild(element);
+    /* ---------- Compact UI, created on first use ---------- */
+    function createButton(text, label, handler) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = text;
+        button.title = label;
+        button.setAttribute("aria-label", label);
+        button.className = `${id}-btn`;
+        button.addEventListener("click", handler);
+        return button;
+    }
+    function ensureStyles() {
+        if (state.destroyed) return;
+        if (state.style && state.style.isConnected) return;
+        if (!document.head && !document.body) return;
+        const style = document.createElement("style");
+        style.id = `${id}-styles`;
+        style.textContent = `
+          @keyframes ${id}-reset {from{opacity:.7}to{opacity:1}}
+          .${id}-flash{animation:${id}-reset 1.3s ease 1}
+          #${id}{position:fixed;right:12px;bottom:12px;width:min(430px,calc(100vw - 24px));
+            height:320px;max-height:70vh;display:flex;flex-direction:column;gap:8px;padding:10px;
+            background:#191919;color:#e2ffe7;border:1px solid #46db85;border-radius:8px;
+            box-shadow:0 6px 25px #0009;box-sizing:border-box;font:12px/1.45 monospace;
+            z-index:2147483647;touch-action:manipulation}
+          #${id}[hidden],#${id} [hidden]{display:none!important}
+          #${id} button{font:11px/1.2 sans-serif;min-height:30px;cursor:pointer}
+          #${id} .${id}-btn{border:1px solid #616161;border-radius:4px;background:#292929;
+            color:#fff;padding:6px;touch-action:manipulation}
+          #${id} .${id}-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px}
+          #${id} .${id}-title{font-weight:bold;flex:1 1 120px;min-width:0;overflow:hidden;text-overflow:ellipsis}
+          #${id} .${id}-body{flex:1;min-height:0;overflow:auto;white-space:pre-wrap;
+            overflow-wrap:anywhere;user-select:text}
+          #${id} .${id}-actions{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:5px}
+          #${id} .${id}-status{font-size:11px;color:#ace3fc}
+          #${id} button:focus-visible{outline:2px solid #91dfff;outline-offset:2px}
+          @media(max-width:480px){#${id}{right:8px;bottom:8px;width:calc(100vw - 16px);
+            height:290px;font-size:11px}}
+          @media(prefers-reduced-motion:reduce){.${id}-flash{animation:none}}
+        `;
+        (document.head || document.body).appendChild(style);
+        state.style = style;
+    }
+    function ensureUI() {
+        if (state.destroyed) return false;
+        if (state.root && state.root.isConnected) { ensureStyles(); return true; }
+        if (!document.body) return false;
+        ensureStyles();
+        const root = document.createElement("section");
+        root.id = id;
+        root.hidden = true;
+        root.setAttribute("aria-label", `Debug console: ${String(scriptNamespace)}`);
+        const toolbar = document.createElement("div");
+        toolbar.className = `${id}-toolbar`;
+        const title = document.createElement("span");
+        title.className = `${id}-title`;
+        title.textContent = `🪲 ${String(scriptNamespace)}`;
+        toolbar.append(title,
+            createButton("Copy", "Copy logs", function () { void copy(this); }),
+            createButton("Clear", "Clear logs", clear),
+            createButton("🔍", "Inspect Torn DOM element", inspect),
+            createButton("Hide", "Hide debugger", () => toggleView()));
+        const logArea = document.createElement("pre");
+        logArea.className = `${id}-body`;
+        logArea.style.margin = "0";
+        const inspector = document.createElement("div");
+        inspector.className = `${id}-body`;
+        inspector.hidden = true;
+        const actions = document.createElement("div");
+        actions.className = `${id}-actions`;
+        actions.append(
+            createButton("Pick", "Pick element by tapping it", startPicker),
+            createButton("↑ Parent", "Inspect parent element", () => moveSelection("parent")),
+            createButton("↓ Child", "Inspect first child element", () => moveSelection("child")),
+            createButton("Watch", "Watch selected element for DOM mutations", () => { watchElement(); }),
+            createButton("Stop watch", "Disconnect mutation observers", stopWatch),
+            createButton("Copy DOM", "Copy sanitized DOM report", function () { void copyInspection(this); }),
+            createButton("Exit", "Close inspector", stopInspection));
+        const status = document.createElement("div");
+        status.className = `${id}-status`;
+        const details = document.createElement("pre");
+        details.style.cssText = "white-space:pre-wrap;overflow-wrap:anywhere;margin:5px 0;font:inherit";
+        inspector.append(actions, status, details);
+        root.append(toolbar, logArea, inspector);
+        document.body.appendChild(root);
+        Object.assign(state, { root, logArea, inspector, inspectorText: details, statusBar: status });
+        attachUIObserver();
+        return true;
+    }
+    function attachUIObserver() {
+        if (typeof MutationObserver === "undefined" || !document.body) return;
+        if (state.uiObserver) state.uiObserver.disconnect();
+        // Only direct children of body, not the constantly changing React subtree.
+        state.uiObserver = new MutationObserver(() => {
+            if (state.root && (!state.root.isConnected || state.observedBody !== document.body)) {
+                stopPicker();
+                stopWatch();
+                removeHighlight();
+                setViewportListeners(false);
+                if (state.root) state.root.remove();
+                if (state.resizeObserver) state.resizeObserver.disconnect();
+                state.resizeObserver = null;
+                state.selected = null;
+                state.root = state.logArea = state.inspector = state.inspectorText = state.statusBar = null;
+                state.uiObserver.disconnect();
+            }
+        });
+        state.uiObserver.observe(document.body, { childList: true });
+        if (document.documentElement) state.uiObserver.observe(document.documentElement, { childList: true });
+        state.observedBody = document.body;
+    }
+    function showPanel(panel) {
+        if (!ensureUI()) return false;
+        state.root.hidden = false;
+        state.panelMode = panel;
+        setViewportListeners(panel === "inspect");
+        state.logArea.hidden = panel !== "logs";
+        state.inspector.hidden = panel !== "inspect";
+        if (panel === "logs") renderLogs();
+        else updateInspector();
+        return true;
+    }
+    function toggleView() {
+        if (!ensureUI()) return false;
+        if (!state.root.hidden) {
+            // A hidden debugger must not keep an active DOM picker or watch.
+            stopInspection();
+            state.root.hidden = true;
+            return false;
+        }
+        showPanel("logs");
         return true;
     }
 
-    /* ============================================================
-     * 5. SAFE SERIALIZATION
-     * ============================================================ */
-
-    function safeSerialize(value) {
-        /*
-         * Fast path for strings.
-         */
-        if (typeof value === "string") {
-            return value;
+    function destroy() {
+        if (state.destroyed) return;
+        state.destroyed = true;
+        stopInspection();
+        if (state.uiObserver) state.uiObserver.disconnect();
+        if (state.resizeObserver) state.resizeObserver.disconnect();
+        for (const handle of state.frames) {
+            if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
         }
-
-        /*
-         * Primitive values.
-         */
-        if (
-            value === null ||
-            typeof value === "number" ||
-            typeof value === "boolean" ||
-            typeof value === "bigint"
-        ) {
-            try {
-                return String(value);
-            } catch (_) {
-                return "[Unserializable Primitive]";
-            }
+        state.frames.clear();
+        for (const [button, saved] of state.statuses) {
+            clearTimeout(saved.timer);
+            button.replaceChildren(...saved.nodes);
         }
-
-        if (typeof value === "undefined") {
-            return "undefined";
-        }
-
-        if (typeof value === "symbol") {
-            try {
-                return value.toString();
-            } catch (_) {
-                return "[Symbol]";
-            }
-        }
-
-        if (typeof value === "function") {
-            try {
-                return `[Function: ${value.name || "anonymous"}]`;
-            } catch (_) {
-                return "[Function]";
-            }
-        }
-
-        /*
-         * Error objects deserve special handling because
-         * JSON.stringify(new Error()) normally returns "{}".
-         */
-        if (value instanceof Error) {
-            const errorObject = {
-                name: value.name,
-                message: value.message,
-                stack: value.stack
-            };
-
-            try {
-                return JSON.stringify(errorObject);
-            } catch (_) {
-                return `${value.name || "Error"}: ${value.message || ""}`;
-            }
-        }
-
-        /*
-         * General objects.
-         *
-         * WeakSet prevents circular-reference crashes.
-         */
-        try {
-            const seen = new WeakSet();
-
-            const serialized = JSON.stringify(
-                value,
-                (key, nestedValue) => {
-                    if (typeof nestedValue === "bigint") {
-                        return `${nestedValue}n`;
-                    }
-
-                    if (typeof nestedValue === "undefined") {
-                        return "[undefined]";
-                    }
-
-                    if (
-                        typeof nestedValue === "object" &&
-                        nestedValue !== null
-                    ) {
-                        if (seen.has(nestedValue)) {
-                            return "[Circular]";
-                        }
-
-                        seen.add(nestedValue);
-                    }
-
-                    return nestedValue;
-                }
-            );
-
-            if (typeof serialized === "string") {
-                return serialized;
-            }
-        } catch (_) {
-            // Fall through to String() fallback.
-        }
-
-        try {
-            return String(value);
-        } catch (_) {
-            return "[Serialization Error]";
-        }
+        state.statuses.clear();
+        if (state.root) state.root.remove();
+        if (state.style) state.style.remove();
+        removeHighlight();
+        state.root = state.logArea = state.inspector = state.inspectorText = state.statusBar = state.style = null;
+        clear();
     }
-
-    /* ============================================================
-     * 6. LOG ENTRY MANAGEMENT
-     * ============================================================ */
-
-    function truncateLogEntry(entry) {
-        if (entry.length <= MAX_SINGLE_LOG_LENGTH) {
-            return entry;
-        }
-
-        return (
-            entry.slice(0, MAX_SINGLE_LOG_LENGTH - 40) +
-            "\n...[LOG ENTRY TRUNCATED]..."
-        );
-    }
-
-    function pruneBufferForEntry(entryLength) {
-        while (
-            state.logs.length > 0 &&
-            state.currentBufferLength + entryLength >
-                MAX_LOG_STRING_LENGTH
-        ) {
-            const removed = state.logs.shift();
-
-            if (typeof removed === "string") {
-                state.currentBufferLength -= removed.length + 1;
-            }
-        }
-
-        /*
-         * Defensive correction against any impossible negative state
-         * caused by external mutation or future implementation changes.
-         */
-        if (state.currentBufferLength < 0) {
-            state.currentBufferLength = 0;
-        }
-    }
-
-    function renderLogs() {
-        const logArea = state.domElements.logArea;
-
-        if (!logArea || !logArea.isConnected) {
-            return;
-        }
-
-        logArea.textContent = state.logs.join("\n");
-
-        const container = state.domElements.container;
-
-        if (container && container.isConnected) {
-            container.scrollTop = container.scrollHeight;
-        }
-    }
-
-    /* ============================================================
-     * 7. PUBLIC LOGGING ENGINE
-     * ============================================================ */
-
-    function log(message, level = "INFO") {
-        const time = new Date().toLocaleTimeString();
-
-        let cleanMessage = safeSerialize(message);
-
-        cleanMessage = truncateLogEntry(cleanMessage);
-
-        const normalizedLevel =
-            typeof level === "string"
-                ? level.toUpperCase()
-                : "INFO";
-
-        let entry =
-            `[${time}] [${normalizedLevel}] ${cleanMessage}`;
-
-        entry = truncateLogEntry(entry);
-
-        const entryLength = entry.length + 1;
-
-        /*
-         * If the entry is somehow still too large, do not store it.
-         */
-        if (entry.length > MAX_LOG_STRING_LENGTH) {
-            return;
-        }
-
-        pruneBufferForEntry(entryLength);
-
-        state.logs.push(entry);
-        state.currentBufferLength += entryLength;
-
-        renderLogs();
-    }
-
-    function info(message) {
-        log(message, "INFO");
-    }
-
-    function warn(message) {
-        log(message, "WARN");
-    }
-
-    function error(message) {
-        log(message, "ERROR");
-    }
-
-    /* ============================================================
-     * 8. CLEAR LOGS
-     * ============================================================ */
-
-    function clearLogs() {
-        state.logs.length = 0;
-        state.currentBufferLength = 0;
-
-        renderLogs();
-    }
-
-    /* ============================================================
-     * 9. COPY STATUS UI
-     * ============================================================ */
-
-    function setButtonStatus(button, text, statusClass = "") {
-        if (!button) {
-            return;
-        }
-
-        button.textContent = text;
-
-        if (statusClass) {
-            button.dataset.debugStatus = statusClass;
-        } else {
-            delete button.dataset.debugStatus;
-        }
-    }
-
-    /*
-     * Restore button state without using a timer.
-     *
-     * CSS animation provides the delay and animationend restores
-     * the original label. This avoids setTimeout-based state handling.
-     */
-    function prepareStatusAnimation(button) {
-        if (!button) {
-            return;
-        }
-
-        if (button.dataset.debugStatusListener === "1") {
-            return;
-        }
-
-        button.dataset.debugStatusListener = "1";
-
-        button.addEventListener("animationend", (event) => {
-            if (event.animationName !== "us-debug-status-reset") {
-                return;
-            }
-
-            const originalText =
-                button.dataset.debugOriginalText || "Copy Logs";
-
-            button.textContent = originalText;
-
-            delete button.dataset.debugStatus;
-        });
-    }
-
-    function showCopyStatus(button, text, originalText = null) {
-        if (!button) {
-            return;
-        }
-
-        prepareStatusAnimation(button);
-
-        if (originalText) {
-            button.dataset.debugOriginalText = originalText;
-        } else if (!button.dataset.debugOriginalText) {
-            button.dataset.debugOriginalText =
-                button.textContent || "Copy Logs";
-        }
-
-        button.classList.remove("us-debug-status-reset");
-
-        /*
-         * Force animation restart without a timing delay.
-         */
-        void button.offsetWidth;
-
-        button.textContent = text;
-        button.classList.add("us-debug-status-reset");
-    }
-
-    /* ============================================================
-     * 10. CLIPBOARD ENGINE
-     * ============================================================ */
-
-    async function copyLogs(buttonElement = null) {
-        const payload = state.logs.join("\n");
-
-        if (!payload) {
-            showCopyStatus(buttonElement, "Empty!");
-            return false;
-        }
-
-        /*
-         * Preferred modern clipboard implementation.
-         */
-        if (
-            typeof navigator !== "undefined" &&
-            navigator.clipboard &&
-            typeof navigator.clipboard.writeText === "function"
-        ) {
-            try {
-                await navigator.clipboard.writeText(payload);
-
-                showCopyStatus(buttonElement, "Copied!");
-
-                return true;
-            } catch (_) {
-                /*
-                 * Continue into compatibility fallback.
-                 */
-            }
-        }
-
-        /*
-         * Legacy compatibility path.
-         *
-         * Still useful for restricted userscript environments,
-         * embedded WebViews, and older browser implementations.
-         */
-        const success = handleCopyFallback(payload);
-
-        if (success) {
-            showCopyStatus(buttonElement, "Copied!");
-            return true;
-        }
-
-        showCopyStatus(buttonElement, "Failed!");
-        return false;
-    }
-
-    function handleCopyFallback(textData) {
-        try {
-            const body = getDocumentBody();
-
-            if (!body) {
-                return false;
-            }
-
-            const textarea = document.createElement("textarea");
-
-            textarea.value = textData;
-
-            textarea.setAttribute("readonly", "");
-            textarea.style.position = "fixed";
-            textarea.style.top = "0";
-            textarea.style.left = "0";
-            textarea.style.width = "1px";
-            textarea.style.height = "1px";
-            textarea.style.padding = "0";
-            textarea.style.border = "0";
-            textarea.style.outline = "0";
-            textarea.style.boxShadow = "none";
-            textarea.style.background = "transparent";
-            textarea.style.opacity = "0";
-
-            body.appendChild(textarea);
-
-            textarea.focus();
-            textarea.select();
-
-            /*
-             * iOS/WebView compatibility.
-             */
-            try {
-                textarea.setSelectionRange(
-                    0,
-                    textarea.value.length
-                );
-            } catch (_) {
-                // Not supported in every environment.
-            }
-
-            let success = false;
-
-            try {
-                success = document.execCommand("copy");
-            } catch (_) {
-                success = false;
-            }
-
-            textarea.remove();
-
-            return Boolean(success);
-        } catch (copyError) {
-            /*
-             * Logging the failure is intentionally done without
-             * console.error so the module never reintroduces the
-             * native console logging that the architecture is
-             * designed to replace.
-             */
-            error({
-                operation: "clipboard-fallback",
-                message:
-                    copyError && copyError.message
-                        ? copyError.message
-                        : String(copyError)
-            });
-
-            return false;
-        }
-    }
-
-    /* ============================================================
-     * 11. DEBUGGER UI
-     * ============================================================ */
-
-    function injectStyles() {
-        if (document.getElementById(`${prefix}-style`)) {
-            return;
-        }
-
-        const styleNode = document.createElement("style");
-
-        styleNode.id = `${prefix}-style`;
-
-        styleNode.textContent = `
-            @keyframes us-debug-status-reset {
-                from {
-                    opacity: 0.75;
-                }
-                to {
-                    opacity: 1;
-                }
-            }
-
-            #${CONTAINER_ID} .us-debug-status-reset {
-                animation: us-debug-status-reset 1.5s ease-in-out 1;
-            }
-        `;
-
-        const head = document.head;
-
-        if (head) {
-            head.appendChild(styleNode);
-        } else {
-            const body = getDocumentBody();
-
-            if (body) {
-                body.appendChild(styleNode);
-            }
-        }
-    }
-
-    function createDebuggerContainer() {
-        const body = getDocumentBody();
-
-        if (!body) {
-            return null;
-        }
-
-        const existingContainer = getExistingContainer();
-
-        if (existingContainer) {
-            state.domElements.container = existingContainer;
-
-            const existingLogArea =
-                document.getElementById(LOG_AREA_ID);
-
-            state.domElements.logArea = existingLogArea;
-
-            renderLogs();
-
-            return existingContainer;
-        }
-
-        injectStyles();
-
-        const container = document.createElement("div");
-
-        container.id = CONTAINER_ID;
-
-        container.style.cssText = [
-            "position:fixed",
-            "bottom:12px",
-            "right:12px",
-            "width:calc(100% - 24px)",
-            "max-width:420px",
-            "height:280px",
-            "background:#181818",
-            "color:#00ff66",
-            "font-family:monospace",
-            "font-size:11px",
-            "padding:12px",
-            "z-index:2147483647",
-            "border:1px solid #00ff66",
-            "overflow-y:auto",
-            "overflow-x:hidden",
-            "box-shadow:0 4px 20px rgba(0,0,0,0.7)",
-            "border-radius:4px",
-            "box-sizing:border-box",
-            "touch-action:pan-y"
-        ].join(";");
-
-        const header = document.createElement("div");
-
-        header.style.cssText = [
-            "display:flex",
-            "justify-content:space-between",
-            "align-items:center",
-            "gap:8px",
-            "margin-bottom:8px",
-            "border-bottom:1px solid #333",
-            "padding-bottom:5px",
-            "user-select:none"
-        ].join(";");
-
-        const title = document.createElement("span");
-
-        title.textContent =
-            `DEBUG LOG [${String(scriptNamespace)}]`;
-
-        title.style.cssText = [
-            "font-weight:bold",
-            "letter-spacing:0.5px",
-            "overflow:hidden",
-            "text-overflow:ellipsis",
-            "white-space:nowrap"
-        ].join(";");
-
-        const buttonGroup = document.createElement("div");
-
-        buttonGroup.style.cssText = [
-            "display:flex",
-            "gap:6px",
-            "flex-shrink:0"
-        ].join(";");
-
-        const copyBtn = document.createElement("button");
-
-        copyBtn.type = "button";
-        copyBtn.textContent = "Copy";
-        copyBtn.style.cssText = [
-            "background:#2a2a2a",
-            "color:#fff",
-            "border:1px solid #444",
-            "cursor:pointer",
-            "padding:5px 8px",
-            "font-size:10px",
-            "border-radius:3px",
-            "touch-action:manipulation"
-        ].join(";");
-
-        copyBtn.addEventListener("click", () => {
-            void copyLogs(copyBtn);
-        });
-
-        const clearBtn = document.createElement("button");
-
-        clearBtn.type = "button";
-        clearBtn.textContent = "Clear";
-        clearBtn.style.cssText = [
-            "background:#2a2a2a",
-            "color:#fff",
-            "border:1px solid #444",
-            "cursor:pointer",
-            "padding:5px 8px",
-            "font-size:10px",
-            "border-radius:3px",
-            "touch-action:manipulation"
-        ].join(";");
-
-        clearBtn.addEventListener("click", () => {
-            clearLogs();
-        });
-
-        const closeBtn = document.createElement("button");
-
-        closeBtn.type = "button";
-        closeBtn.textContent = "Hide";
-        closeBtn.style.cssText = [
-            "background:#a82020",
-            "color:#fff",
-            "border:none",
-            "cursor:pointer",
-            "padding:5px 8px",
-            "font-size:10px",
-            "border-radius:3px",
-            "touch-action:manipulation"
-        ].join(";");
-
-        closeBtn.addEventListener("click", () => {
-            container.style.display = "none";
-        });
-
-        const logArea = document.createElement("div");
-
-        logArea.id = LOG_AREA_ID;
-
-        logArea.style.cssText = [
-            "white-space:pre-wrap",
-            "overflow-wrap:anywhere",
-            "word-break:break-word",
-            "font-family:monospace",
-            "line-height:1.4",
-            "user-select:text"
-        ].join(";");
-
-        buttonGroup.appendChild(copyBtn);
-        buttonGroup.appendChild(clearBtn);
-        buttonGroup.appendChild(closeBtn);
-
-        header.appendChild(title);
-        header.appendChild(buttonGroup);
-
-        container.appendChild(header);
-        container.appendChild(logArea);
-
-        if (!appendToBody(container)) {
-            return null;
-        }
-
-        state.domElements.container = container;
-        state.domElements.logArea = logArea;
-
-        renderLogs();
-
-        return container;
-    }
-
-    /* ============================================================
-     * 12. VIEW TOGGLE
-     * ============================================================ */
-
-    function toggleConsoleView() {
-        const existingContainer = getExistingContainer();
-
-        if (existingContainer) {
-            state.domElements.container = existingContainer;
-
-            const existingLogArea =
-                document.getElementById(LOG_AREA_ID);
-
-            state.domElements.logArea = existingLogArea;
-
-            const isHidden =
-                existingContainer.style.display === "none";
-
-            existingContainer.style.display =
-                isHidden ? "block" : "none";
-
-            if (isHidden) {
-                renderLogs();
-            }
-
-            ensureObserver();
-
-            return;
-        }
-
-        const container = createDebuggerContainer();
-
-        if (container) {
-            container.style.display = "block";
-            renderLogs();
-        }
-
-        ensureObserver();
-    }
-
-    /* ============================================================
-     * 13. INITIALIZATION
-     * ============================================================ */
-
-    function initialize() {
-        if (state.destroyed) {
-            return;
-        }
-
-        ensureObserver();
-
-        /*
-         * We intentionally do not use setTimeout/setInterval to wait
-         * for Torn's DOM.
-         *
-         * If body already exists, initialization can proceed.
-         * Otherwise DOMContentLoaded provides the one-time lifecycle
-         * event required for early execution contexts.
-         */
-        if (getDocumentBody()) {
-            return;
-        }
-
-        if (document.readyState === "loading") {
-            document.addEventListener(
-                "DOMContentLoaded",
-                initialize,
-                { once: true }
-            );
-        }
-    }
-
-    initialize();
-
-    /* ============================================================
-     * 14. PUBLIC API
-     * ============================================================ */
 
     return Object.freeze({
-        /*
-         * Primary logging API.
-         */
-        log,
-
-        /*
-         * Structured convenience methods.
-         */
-        info,
-        warn,
-        error,
-
-        /*
-         * REQUIRED BY THE USERSCRIPT ARCHITECTURE.
-         *
-         * Future settings UI:
-         * copyButton.onclick = function () {
-         *     MyDebug.copy(this);
-         * };
-         */
-        copy: copyLogs,
-
-        /*
-         * Debugger overlay.
-         */
-        toggleView: toggleConsoleView,
-
-        /*
-         * Optional maintenance operation.
-         */
-        clear: clearLogs
+        log, info, warn, error, copy, clear, toggleView,
+        inspect, inspectElement, watchElement, stopInspection,
+        getInspectionReport, copyInspection, destroy
     });
 }
